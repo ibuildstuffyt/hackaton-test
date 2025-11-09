@@ -340,7 +340,7 @@ class FPVSimulator:
         """Update camera2 rotation based on WASD keyboard input"""
         rotation_speed = 2.0 * self.dt  # Rotation speed per frame
         
-        # W/S: Pitch camera up/down (look up/down) - SWAPPED
+        # W/S: Pitch camera up/down (look up/down) - rotate around X-axis
         if keys[pygame.K_w]:
             # Pitch down: rotate around X-axis (positive for looking down)
             pitch_rot = np.array([
@@ -361,7 +361,7 @@ class FPVSimulator:
             ], dtype=np.float32)
             self.camera2_rotation = self.physics.quaternion_multiply(self.camera2_rotation, pitch_rot)
         
-        # A/D: Yaw camera left/right (look left/right)
+        # A/D: Yaw camera left/right (look left/right) - rotate around Y-axis
         if keys[pygame.K_a]:
             # Yaw left: rotate around Y-axis (positive for left)
             yaw_rot = np.array([
