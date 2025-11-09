@@ -561,6 +561,117 @@ class FPVSimulator:
         
         glEnable(GL_LIGHTING)
     
+    def _compute_crosshair_ndc_in_cam2(self, half_width: int):
+        """Compute NDC position in camera-2 view where camera-1 forward points.
+        Returns (x_ndc, y_ndc, clamped) where NDC is in [-1,1]."""
+        # Field of view and aspect for right viewport
+        aspect = (half_width / self.height) if self.height > 0 else 1.0
+        fov_y = math.radians(70.0)
+        fov_x = 2.0 * math.atan(aspect * math.tan(fov_y / 2.0))
+        
+        # World-space forward direction of camera-1 (drone orientation with 0deg tilt)
+        forward1_world = self.physics.quaternion_rotate_vector(
+            self.physics.orientation, np.array([0.0, 0.0, -1.0])
+        )
+        
+        # Camera-2 absolute orientation = drone orientation * camera2 relative rotation
+        q_cam2 = self.physics.quaternion_multiply(self.physics.orientation, self.camera2_rotation)
+        # Inverse quaternion
+        q_cam2_inv = np.array([q_cam2[0], -q_cam2[1], -q_cam2[2], -q_cam2[3]], dtype=np.float32)
+        
+        # Express camera-1 forward in camera-2 local space
+        dir_cam2 = self.physics.quaternion_rotate_vector(q_cam2_inv, forward1_world)
+        
+        # Map to angles relative to camera-2 axes
+        # yaw: left/right, pitch: up/down
+        yaw = math.atan2(dir_cam2[0], -dir_cam2[2])
+        horiz = math.sqrt(dir_cam2[0] * dir_cam2[0] + dir_cam2[2] * dir_cam2[2])
+        pitch = math.atan2(dir_cam2[1], horiz)
+        
+        # Project angles to NDC using FOV
+        x_ndc = math.tan(yaw) / math.tan(fov_x / 2.0) if fov_x > 0 else 0.0
+        y_ndc = math.tan(pitch) / math.tan(fov_y / 2.0) if fov_y > 0 else 0.0
+        
+        # Clamp behavior: if behind camera-2, force to border; if out of frustum, clamp to border
+        s = max(abs(x_ndc), abs(y_ndc))
+        clamped = False
+        if dir_cam2[2] >= 0.0:
+            # Behind the camera: push to the nearest border in the same direction
+            clamped = True
+            if s < 1e-6:
+                x_ndc, y_ndc = 0.0, 1.0
+            else:
+                x_ndc /= s
+                y_ndc /= s
+        else:
+            if s > 1.0:
+                clamped = True
+                x_ndc /= s
+                y_ndc /= s
+        
+        return x_ndc, y_ndc, clamped
+    
+    def draw_crosshair_overlay(self, half_width: int):
+        """Draw a small crosshair in the right viewport, showing camera-1 center in camera-2."""
+        # Compute NDC in camera-2, then to pixel coords within right viewport
+        x_ndc, y_ndc, clamped = self._compute_crosshair_ndc_in_cam2(half_width)
+        px = (x_ndc * 0.5 + 0.5) * half_width
+        py = (y_ndc * 0.5 + 0.5) * self.height
+        
+        # Set up 2D overlay for the right half viewport (viewport already set to right)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, half_width, 0, self.height, -1, 1)
+        
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        
+        # Overlay state
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_LIGHTING)
+        
+        # Style: white when normal, yellow when clamped
+        if clamped:
+            glColor3f(1.0, 0.85, 0.0)
+        else:
+            glColor3f(1.0, 1.0, 1.0)
+        
+        glLineWidth(2.0)
+        
+        # Crosshair lines (~12px total length)
+        half_len = 6.0
+        glBegin(GL_LINES)
+        # Horizontal line
+        glVertex2f(px - half_len, py)
+        glVertex2f(px + half_len, py)
+        # Vertical line
+        glVertex2f(px, py - half_len)
+        glVertex2f(px, py + half_len)
+        glEnd()
+        
+        # When clamped, draw a small ring to signify clamping
+        if clamped:
+            radius = 6.0
+            segments = 20
+            glBegin(GL_LINE_LOOP)
+            for i in range(segments):
+                angle = 2.0 * math.pi * i / segments
+                vx = px + radius * math.cos(angle)
+                vy = py + radius * math.sin(angle)
+                glVertex2f(vx, vy)
+            glEnd()
+        
+        # Restore state
+        glEnable(GL_LIGHTING)
+        glEnable(GL_DEPTH_TEST)
+        
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+    
     def render(self):
         # Clear buffers once
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -588,6 +699,8 @@ class FPVSimulator:
         self.update_camera_secondary()
         self.draw_world()
         self.draw_hoops()
+        # Overlay crosshair for right viewport
+        self.draw_crosshair_overlay(half_width)
         
         # Reset viewport to full screen
         glViewport(0, 0, self.width, self.height)
