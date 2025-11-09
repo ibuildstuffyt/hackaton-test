@@ -139,8 +139,19 @@ def load_world_from_file(file_path: str):
     return vertices, faces
 
 
+def run_simulator_window(window_mode, vertices, faces):
+    """Run a simulator window in a separate process"""
+    from fpv_simulator import FPVSimulator
+    simulator = FPVSimulator(window_mode=window_mode)
+    simulator.load_world_mesh(vertices, faces)
+    simulator.run()
+
+
 def main():
     """Main function"""
+    import multiprocessing
+    import time
+    
     print("=" * 60)
     print("FPV Simulator - Marble World Integration")
     print("=" * 60)
@@ -174,19 +185,49 @@ def main():
         print("No worlds found or API connection failed.")
         print("Using test environment...")
     
-    # Initialize simulator
-    print("\nInitializing FPV Simulator...")
-    simulator = FPVSimulator()
-    
     # Load world mesh (for now, using test world)
     print("Loading world mesh...")
     vertices, faces = load_world_from_file("test_world")
-    simulator.load_world_mesh(vertices, faces)
     
-    # Run simulator
-    print("\nStarting simulator...")
-    print("Make sure your DJI controller is connected via USB!")
-    simulator.run()
+    # Launch both windows as separate processes
+    print("\nLaunching simulator windows...")
+    print("Window 1: Controller View (Drone control)")
+    print("Window 2: 360° View (WASD camera control)")
+    print("\nMake sure your DJI controller is connected via USB!")
+    print("=" * 60)
+    
+    # Set start method to 'spawn' for macOS compatibility
+    multiprocessing.set_start_method('spawn', force=True)
+    
+    # Create processes for both windows
+    window1_process = multiprocessing.Process(
+        target=run_simulator_window, 
+        args=(1, vertices, faces),
+        name="Window1-Controller"
+    )
+    window2_process = multiprocessing.Process(
+        target=run_simulator_window, 
+        args=(2, vertices, faces),
+        name="Window2-360View"
+    )
+    
+    # Start window 1 first
+    window1_process.start()
+    time.sleep(0.5)  # Small delay to ensure window 1 initializes first
+    
+    # Start window 2
+    window2_process.start()
+    
+    try:
+        # Wait for both processes to complete
+        window1_process.join()
+        window2_process.join()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        window1_process.terminate()
+        window2_process.terminate()
+        window1_process.join()
+        window2_process.join()
 
 
 if __name__ == "__main__":

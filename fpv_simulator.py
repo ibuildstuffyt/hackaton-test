@@ -207,20 +207,35 @@ class QuadcopterPhysics:
 class FPVSimulator:
     """Main FPV simulator"""
     
-    def __init__(self):
+    def __init__(self, window_mode=1):
+        """
+        Initialize FPV Simulator
+        window_mode: 1 for controller view (Window 1), 2 for 360 view (Window 2)
+        """
+        import os
+        
         pygame.init()
+        self.window_mode = window_mode
         self.width = 1280
         self.height = 720
-        self.screen = pygame.display.set_mode((self.width, self.height), pygame.DOUBLEBUF | pygame.OPENGL)
-        pygame.display.set_caption("FPV Simulator")
         
-        # Initialize OpenGL state once
+        # Position windows side by side on macOS
+        if window_mode == 1:
+            os.environ['SDL_VIDEO_WINDOW_POS'] = '50,100'
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.DOUBLEBUF | pygame.OPENGL)
+            pygame.display.set_caption("1 - Controller View")
+        else:
+            os.environ['SDL_VIDEO_WINDOW_POS'] = f'{self.width + 100},100'
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.DOUBLEBUF | pygame.OPENGL)
+            pygame.display.set_caption("2 - 360° View")
+        
+        # Initialize OpenGL
         self.init_opengl()
         
         self.controller = DJIController()
         self.physics = QuadcopterPhysics()
         
-        # Second camera rotation (independent WASD-controlled camera for right viewport)
+        # Second camera rotation (independent WASD-controlled camera)
         self.camera2_rotation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Quaternion (w, x, y, z)
         
         self.world_vertices = []
@@ -229,6 +244,9 @@ class FPVSimulator:
         
         self.clock = pygame.time.Clock()
         self.dt = 0.016
+        
+        # Shared state file for multi-window sync
+        self.state_file = "/tmp/fpv_sim_state.npy"
     
     def init_opengl(self):
         """Initialize OpenGL state once at startup"""
@@ -611,18 +629,18 @@ class FPVSimulator:
         
         return x_ndc, y_ndc, clamped
     
-    def draw_crosshair_overlay(self, half_width: int):
-        """Draw a small crosshair in the right viewport, showing camera-1 center in camera-2."""
-        # Compute NDC in camera-2, then to pixel coords within right viewport
-        x_ndc, y_ndc, clamped = self._compute_crosshair_ndc_in_cam2(half_width)
-        px = (x_ndc * 0.5 + 0.5) * half_width
+    def draw_crosshair_overlay(self):
+        """Draw a small crosshair showing where camera-1 is pointing in camera-2's view."""
+        # Compute NDC in camera-2, then to pixel coords
+        x_ndc, y_ndc, clamped = self._compute_crosshair_ndc_in_cam2(self.width)
+        px = (x_ndc * 0.5 + 0.5) * self.width
         py = (y_ndc * 0.5 + 0.5) * self.height
         
-        # Set up 2D overlay for the right half viewport (viewport already set to right)
+        # Set up 2D overlay
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glLoadIdentity()
-        glOrtho(0, half_width, 0, self.height, -1, 1)
+        glOrtho(0, self.width, 0, self.height, -1, 1)
         
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
@@ -672,38 +690,76 @@ class FPVSimulator:
         glMatrixMode(GL_PROJECTION)
         glPopMatrix()
     
+    def save_state(self):
+        """Save physics and camera state to file (for window 1)"""
+        if self.window_mode == 1:
+            try:
+                state = {
+                    'position': self.physics.position,
+                    'velocity': self.physics.velocity,
+                    'orientation': self.physics.orientation,
+                    'angular_velocity': self.physics.angular_velocity,
+                    'camera2_rotation': self.camera2_rotation,
+                    'world_vertices': self.world_vertices,
+                    'world_faces': self.world_faces,
+                    'hoops': self.hoops
+                }
+                np.save(self.state_file, state, allow_pickle=True)
+            except Exception as e:
+                pass  # Silently fail if can't save
+    
+    def load_state(self):
+        """Load physics and camera state from file (for window 2)"""
+        if self.window_mode == 2:
+            try:
+                import os
+                if os.path.exists(self.state_file):
+                    state = np.load(self.state_file, allow_pickle=True).item()
+                    self.physics.position = state['position']
+                    self.physics.velocity = state['velocity']
+                    self.physics.orientation = state['orientation']
+                    self.physics.angular_velocity = state['angular_velocity']
+                    # Load camera2_rotation from Window 1's WASD input
+                    self.camera2_rotation = state['camera2_rotation']
+                    
+                    # Load world data if not already loaded
+                    if not self.world_vertices:
+                        self.world_vertices = state.get('world_vertices', [])
+                        self.world_faces = state.get('world_faces', [])
+                        self.hoops = state.get('hoops', [])
+                        self._ground_faces = None
+                        self._block_faces = None
+            except Exception as e:
+                pass  # Silently fail if can't load
+    
     def render(self):
-        # Clear buffers once
+        # Clear buffers
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         
-        # Calculate half width for split screen
-        half_width = self.width // 2
-        aspect_ratio = (half_width / self.height)
-        
-        # Left viewport: Original camera (follows drone orientation)
-        glViewport(0, 0, half_width, self.height)
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        gluPerspective(70, aspect_ratio, 0.1, 100.0)
-        glMatrixMode(GL_MODELVIEW)
-        self.update_camera()
-        self.draw_world()
-        self.draw_hoops()
-        
-        # Right viewport: Second camera (WASD-controlled)
-        glViewport(half_width, 0, half_width, self.height)
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        gluPerspective(70, aspect_ratio, 0.1, 100.0)
-        glMatrixMode(GL_MODELVIEW)
-        self.update_camera_secondary()
-        self.draw_world()
-        self.draw_hoops()
-        # Overlay crosshair for right viewport
-        self.draw_crosshair_overlay(half_width)
-        
-        # Reset viewport to full screen
+        # Full window viewport
         glViewport(0, 0, self.width, self.height)
+        aspect_ratio = self.width / self.height
+        
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(70, aspect_ratio, 0.1, 100.0)
+        glMatrixMode(GL_MODELVIEW)
+        
+        # Render based on window mode
+        if self.window_mode == 1:
+            # Window 1: Controller view (follows drone orientation)
+            self.update_camera()
+        else:
+            # Window 2: 360° view (WASD-controlled)
+            self.update_camera_secondary()
+        
+        # Draw world and hoops
+        self.draw_world()
+        self.draw_hoops()
+        
+        # Draw crosshair overlay in Window 2 (shows where Window 1 is looking)
+        if self.window_mode == 2:
+            self.draw_crosshair_overlay()
         
         # Swap buffers
         pygame.display.flip()
@@ -711,19 +767,27 @@ class FPVSimulator:
     def run(self):
         running = True
         print("=" * 60)
-        print("FPV Simulator - Full Control (Throttle + Pitch + Roll + Yaw)")
-        print("=" * 60)
-        print("Controls:")
-        print("  DJI Controller:")
-        print("    Axis 2 (Channel 2): Throttle (0% to 100%)")
-        print("    Axis 1 (Channel 1): Pitch (forward/back tilt)")
-        print("    Axis 0 (Channel 0): Roll (left/right tilt)")
-        print("    Axis 3 (Channel 3): Yaw (rotation)")
-        print("  Keyboard:")
-        print("    W/S: Look down/up (right camera pitch)")
-        print("    A/D: Look left/right (right camera yaw)")
-        print("    R: Reset drone and camera")
-        print("    ESC: Exit")
+        if self.window_mode == 1:
+            print("Window 1 - Controller View (FOCUS THIS WINDOW)")
+            print("=" * 60)
+            print("Controls:")
+            print("  DJI Controller:")
+            print("    Axis 2 (Channel 2): Throttle (0% to 100%)")
+            print("    Axis 1 (Channel 1): Pitch (forward/back tilt)")
+            print("    Axis 0 (Channel 0): Roll (left/right tilt)")
+            print("    Axis 3 (Channel 3): Yaw (rotation)")
+            print("  Keyboard (controls Window 2's 360° camera):")
+            print("    W/S: Look down/up in Window 2")
+            print("    A/D: Look left/right in Window 2")
+            print("    R: Reset drone")
+            print("    ESC: Exit")
+        else:
+            print("Window 2 - 360° View (Read-Only Monitor)")
+            print("=" * 60)
+            print("This window displays the 360° view controlled by")
+            print("WASD keys in Window 1. Keep Window 1 focused.")
+            print("  Keyboard:")
+            print("    ESC: Exit")
         print("=" * 60)
         
         while running:
@@ -734,57 +798,56 @@ class FPVSimulator:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_r:
+                    elif event.key == pygame.K_r and self.window_mode == 1:
                         self.reset_drone()
             
-            # Update camera2 rotation based on keyboard input (WASD)
-            keys = pygame.key.get_pressed()
-            self.update_camera2_rotation(keys)
+            # Window 1: Control drone with controller AND camera2 with WASD
+            if self.window_mode == 1:
+                # Get raw axis values directly
+                # Axis 0 = roll, Axis 1 = pitch, Axis 2 = throttle, Axis 3 = yaw
+                axis0_raw = self.controller.joystick.get_axis(0) if self.controller.connected and self.controller.joystick else 0.0
+                axis1_raw = self.controller.joystick.get_axis(1) if self.controller.connected and self.controller.joystick else 0.0
+                axis2_raw = self.controller.joystick.get_axis(2) if self.controller.connected and self.controller.joystick else 0.0
+                axis3_raw = self.controller.joystick.get_axis(3) if self.controller.connected and self.controller.joystick else 0.0
+                
+                # Throttle: Axis 2 from -1 (bottom) to +1 (top) -> map to 0.0 (bottom) to 1.0 (top)
+                throttle = (axis2_raw + 1.0) / 2.0
+                if throttle < 0.01:
+                    throttle = 0.0
+                
+                # Pitch: Axis 1 (inverted because pygame inverts Y)
+                pitch_raw = -axis1_raw
+                
+                # Roll: Axis 0 (left/right stick movement)
+                roll_raw = axis0_raw
+                
+                # Apply exponential curves to pitch and roll for smoother center, more sensitive edges
+                expo_rate = 2.0  # 0.0 = linear, set to 2.0 for 3x sensitivity at max input
+                # Formula: output = input * (1 + expo_rate * input^2)
+                # At max input (1.0): output = 1.0 * (1 + 2.0) = 3.0 (3x more sensitive)
+                pitch = pitch_raw * (1.0 + expo_rate * pitch_raw * pitch_raw)
+                roll = roll_raw * (1.0 + expo_rate * roll_raw * roll_raw)
+                
+                # Yaw: Axis 3 (rotation)
+                yaw = axis3_raw
+                
+                # Set motor speeds (throttle, pitch, roll, and yaw)
+                self.physics.set_motor_speeds(throttle, pitch, roll, yaw)
+                
+                # Update physics
+                self.physics.update(self.dt)
+                
+                # Update camera2 rotation based on keyboard input (WASD) - for Window 2 to display
+                keys = pygame.key.get_pressed()
+                self.update_camera2_rotation(keys)
+                
+                # Save state for window 2
+                self.save_state()
             
-            # Get raw axis values directly
-            # Axis 0 = roll, Axis 1 = pitch, Axis 2 = throttle, Axis 3 = yaw
-            axis0_raw = self.controller.joystick.get_axis(0) if self.controller.connected and self.controller.joystick else 0.0
-            axis1_raw = self.controller.joystick.get_axis(1) if self.controller.connected and self.controller.joystick else 0.0
-            axis2_raw = self.controller.joystick.get_axis(2) if self.controller.connected and self.controller.joystick else 0.0
-            axis3_raw = self.controller.joystick.get_axis(3) if self.controller.connected and self.controller.joystick else 0.0
-            
-            # Throttle: Axis 2 from -1 (bottom) to +1 (top) -> map to 0.0 (bottom) to 1.0 (top)
-            throttle = (axis2_raw + 1.0) / 2.0
-            if throttle < 0.01:
-                throttle = 0.0
-            
-            # Pitch: Axis 1 (inverted because pygame inverts Y)
-            pitch_raw = -axis1_raw
-            
-            # Roll: Axis 0 (left/right stick movement)
-            roll_raw = axis0_raw
-            
-            # Apply exponential curves to pitch and roll for smoother center, more sensitive edges
-            expo_rate = 2.0  # 0.0 = linear, set to 2.0 for 3x sensitivity at max input
-            # Formula: output = input * (1 + expo_rate * input^2)
-            # At max input (1.0): output = 1.0 * (1 + 2.0) = 3.0 (3x more sensitive)
-            pitch = pitch_raw * (1.0 + expo_rate * pitch_raw * pitch_raw)
-            roll = roll_raw * (1.0 + expo_rate * roll_raw * roll_raw)
-            
-            # Yaw: Axis 3 (rotation)
-            yaw = axis3_raw
-            
-            # Set motor speeds (throttle, pitch, roll, and yaw)
-            self.physics.set_motor_speeds(throttle, pitch, roll, yaw)
-            
-            # Debug when pitch, roll, or yaw is applied
-            if abs(pitch) > 0.05:
-                print(f"Pitch: {pitch:.3f} (axis1_raw: {axis1_raw:.3f}), Motor speeds: {self.physics.motor_speeds}")
-                print(f"Angular velocity: {self.physics.angular_velocity}, Pitch component (X-axis): {self.physics.angular_velocity[0]:.3f}")
-            if abs(roll) > 0.05:
-                print(f"Roll: {roll:.3f} (axis0_raw: {axis0_raw:.3f}), Motor speeds: {self.physics.motor_speeds}")
-                print(f"Angular velocity: {self.physics.angular_velocity}, Roll component (Z-axis): {self.physics.angular_velocity[2]:.3f}")
-            if abs(yaw) > 0.05:
-                print(f"Yaw: {yaw:.3f} (axis3_raw: {axis3_raw:.3f}), Motor speeds: {self.physics.motor_speeds}")
-                print(f"Angular velocity: {self.physics.angular_velocity}, Yaw component (Y-axis): {self.physics.angular_velocity[1]:.3f}")
-            
-            # Update physics
-            self.physics.update(self.dt)
+            # Window 2: Load state from Window 1 (read-only display)
+            else:
+                # Load state from window 1 (includes drone physics AND camera2 rotation)
+                self.load_state()
             
             # Render
             self.render()
