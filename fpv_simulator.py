@@ -1,0 +1,564 @@
+"""
+FPV Simulator with realistic quadcopter physics
+Only throttle and roll enabled
+"""
+import pygame
+import numpy as np
+import math
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from dji_controller import DJIController
+
+
+class QuadcopterPhysics:
+    """Realistic quadcopter physics simulation"""
+    
+    def __init__(self):
+        # Physical properties
+        self.mass = 0.5  # kg
+        self.gravity = 9.81  # m/s^2
+        self.max_thrust_per_motor = 2.0 * self.mass * self.gravity / 4.0  # N per motor
+        self.motor_arm_length = 0.15  # m
+        
+        # Inertia tensor (simplified as diagonal) - increased to reduce dangling mass feel
+        self.Ixx = 0.02  # kg*m^2 (increased from 0.01)
+        self.Iyy = 0.02  # kg*m^2 (increased from 0.01)
+        self.Izz = 0.04  # kg*m^2 (increased from 0.02)
+        
+        # Drag coefficients
+        self.linear_drag = 0.1
+        self.angular_drag = 5.0  # Increased to 5x to reduce momentum buildup by 5x
+        
+        # State
+        self.position = np.array([0.0, 0.2, 0.0], dtype=np.float32)
+        self.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.orientation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # quaternion (w, x, y, z)
+        self.angular_velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # (wx, wy, wz)
+        self.motor_speeds = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    
+    def quaternion_multiply(self, q1, q2):
+        """Multiply quaternions"""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ])
+    
+    def quaternion_rotate_vector(self, q, v):
+        """Rotate vector by quaternion"""
+        w, x, y, z = q
+        v_quat = np.array([0.0, v[0], v[1], v[2]])
+        q_inv = np.array([w, -x, -y, -z])
+        temp = self.quaternion_multiply(q, v_quat)
+        result_quat = self.quaternion_multiply(temp, q_inv)
+        return result_quat[1:4]
+    
+    def set_motor_speeds(self, throttle: float, pitch: float, roll: float, yaw: float):
+        """Set motor speeds - throttle, pitch, roll, and yaw"""
+        # Store inputs for reverse detection
+        self.last_pitch_input = getattr(self, 'last_pitch_input', 0.0)
+        self.last_roll_input = getattr(self, 'last_roll_input', 0.0)
+        self.last_yaw_input = getattr(self, 'last_yaw_input', 0.0)
+        
+        # Deadzones
+        deadzone = 0.05
+        if abs(pitch) < deadzone:
+            pitch = 0.0
+        if abs(roll) < deadzone:
+            roll = 0.0
+        if abs(yaw) < deadzone:
+            yaw = 0.0
+        
+        # Detect direction reversal for instant response
+        self.pitch_reversed = (pitch > 0 and self.last_pitch_input < 0) or (pitch < 0 and self.last_pitch_input > 0)
+        self.roll_reversed = (roll > 0 and self.last_roll_input < 0) or (roll < 0 and self.last_roll_input > 0)
+        self.yaw_reversed = (yaw > 0 and self.last_yaw_input < 0) or (yaw < 0 and self.last_yaw_input > 0)
+        
+        self.last_pitch_input = pitch
+        self.last_roll_input = roll
+        self.last_yaw_input = yaw
+        
+        # Motor mixing
+        # Motors: m1=front-left[0], m2=front-right[1], m3=back-left[2], m4=back-right[3]
+        # Pitch: forward pitch (positive) = tilt forward = increase front motors (m1, m2), decrease back motors (m3, m4)
+        # Roll: right roll (positive) = tilt right = increase right motors (m2, m4), decrease left motors (m1, m3)
+        # Yaw: right yaw (positive) = rotate right = increase diagonal motors (m1, m4), decrease (m2, m3)
+        base = throttle
+        pitch_gain = 0.06  # Reduced sensitivity
+        roll_gain = 0.06  # Reduced sensitivity
+        yaw_gain = 0.5  # 5x more sensitive (was 0.1, now 0.5)
+        m1 = base + pitch * pitch_gain - roll * roll_gain + yaw * yaw_gain  # front-left
+        m2 = base + pitch * pitch_gain + roll * roll_gain - yaw * yaw_gain  # front-right
+        m3 = base - pitch * pitch_gain - roll * roll_gain - yaw * yaw_gain  # back-left
+        m4 = base - pitch * pitch_gain + roll * roll_gain + yaw * yaw_gain  # back-right
+        
+        self.motor_speeds = np.clip([m1, m2, m3, m4], 0.0, 1.0)
+    
+    def update(self, dt: float):
+        """Update physics"""
+        total_thrust = np.sum(self.motor_speeds) * self.max_thrust_per_motor
+        
+        # Torques
+        # Motors: m1=front-left[0], m2=front-right[1], m3=back-left[2], m4=back-right[3]
+        # Pitch: front motors (m1, m2) - back motors (m3, m4)
+        pitch_torque = (self.motor_speeds[0] + self.motor_speeds[1] - 
+                       self.motor_speeds[2] - self.motor_speeds[3]) * self.max_thrust_per_motor * self.motor_arm_length
+        # Roll: right motors (m2, m4) - left motors (m1, m3)
+        roll_torque = (self.motor_speeds[1] + self.motor_speeds[3] - 
+                      self.motor_speeds[0] - self.motor_speeds[2]) * self.max_thrust_per_motor * self.motor_arm_length
+        # Yaw: diagonal motors (m1, m4) - (m2, m3)
+        yaw_torque = (self.motor_speeds[0] + self.motor_speeds[3] - 
+                     self.motor_speeds[1] - self.motor_speeds[2]) * self.max_thrust_per_motor * self.motor_arm_length * 0.5
+        
+        # Update angular velocity
+        # Pitch rotates around X-axis (forward/back tilt)
+        # If input reversed direction, aggressively reverse opposing angular velocity (10x more aggressive)
+        if hasattr(self, 'pitch_reversed') and self.pitch_reversed:
+            if (pitch_torque > 0 and self.angular_velocity[0] < 0) or (pitch_torque < 0 and self.angular_velocity[0] > 0):
+                # 10x more aggressive: zero out and apply strong correction in opposite direction
+                self.angular_velocity[0] = 0.0
+                # Apply 10x stronger correction torque
+                self.angular_velocity[0] += (pitch_torque / self.Ixx) * dt * 10.0
+        else:
+            self.angular_velocity[0] += (pitch_torque / self.Ixx) * dt   # X-axis = pitch
+        
+        # Yaw rotates around Y-axis (rotation) - REVERSED
+        if hasattr(self, 'yaw_reversed') and self.yaw_reversed:
+            if (-yaw_torque > 0 and self.angular_velocity[1] < 0) or (-yaw_torque < 0 and self.angular_velocity[1] > 0):
+                # 10x more aggressive: zero out and apply strong correction in opposite direction
+                self.angular_velocity[1] = 0.0
+                # Apply 10x stronger correction torque
+                self.angular_velocity[1] += (-yaw_torque / self.Iyy) * dt * 10.0
+        else:
+            self.angular_velocity[1] += (-yaw_torque / self.Iyy) * dt   # Y-axis = yaw (reversed)
+        
+        # Roll rotates around Z-axis (left/right tilt) - REVERSED
+        if hasattr(self, 'roll_reversed') and self.roll_reversed:
+            if (-roll_torque > 0 and self.angular_velocity[2] < 0) or (-roll_torque < 0 and self.angular_velocity[2] > 0):
+                # 10x more aggressive: zero out and apply strong correction in opposite direction
+                self.angular_velocity[2] = 0.0
+                # Apply 10x stronger correction torque
+                self.angular_velocity[2] += (-roll_torque / self.Izz) * dt * 10.0
+        else:
+            self.angular_velocity[2] += (-roll_torque / self.Izz) * dt   # Z-axis = roll (reversed)
+        
+        self.angular_velocity *= (1.0 - self.angular_drag * dt)
+        
+        # Update orientation
+        w, x, y, z = self.orientation
+        wx, wy, wz = self.angular_velocity
+        q_dot = 0.5 * np.array([
+            -x*wx - y*wy - z*wz,
+            w*wx + y*wz - z*wy,
+            w*wy - x*wz + z*wx,
+            w*wz + x*wy - y*wx
+        ])
+        self.orientation += q_dot * dt
+        norm = np.linalg.norm(self.orientation)
+        if norm > 0:
+            self.orientation /= norm
+        
+        # Thrust vector in world frame
+        up_local = np.array([0.0, 1.0, 0.0])
+        up_world = self.quaternion_rotate_vector(self.orientation, up_local)
+        thrust_force = up_world * total_thrust
+        
+        # Gravity
+        gravity_force = np.array([0.0, -self.mass * self.gravity, 0.0])
+        
+        # Total force
+        total_force = thrust_force + gravity_force
+        
+        # Drag
+        drag_force = -self.velocity * self.linear_drag
+        
+        # Update velocity
+        acceleration = (total_force + drag_force) / self.mass
+        self.velocity += acceleration * dt
+        
+        # Update position
+        self.position += self.velocity * dt
+        
+        # Ground collision
+        if self.position[1] < 0.0:
+            self.position[1] = 0.0
+            self.velocity[1] = 0.0
+    
+    def quaternion_to_rotation_matrix(self, q):
+        """Convert quaternion to 4x4 rotation matrix for OpenGL"""
+        w, x, y, z = q
+        # Normalize
+        norm = math.sqrt(w*w + x*x + y*y + z*z)
+        if norm > 0:
+            w, x, y, z = w/norm, x/norm, y/norm, z/norm
+        
+        # Build 4x4 matrix
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w), 0],
+            [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w), 0],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y), 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+
+class FPVSimulator:
+    """Main FPV simulator"""
+    
+    def __init__(self):
+        pygame.init()
+        self.width = 1280
+        self.height = 720
+        self.screen = pygame.display.set_mode((self.width, self.height), pygame.DOUBLEBUF | pygame.OPENGL)
+        pygame.display.set_caption("FPV Simulator")
+        
+        # Initialize OpenGL state once
+        self.init_opengl()
+        
+        self.controller = DJIController()
+        self.physics = QuadcopterPhysics()
+        
+        self.world_vertices = []
+        self.world_faces = []
+        self.hoops = []  # List of hoops: [(x, z, y_height, radius), ...]
+        
+        self.clock = pygame.time.Clock()
+        self.dt = 0.016
+    
+    def init_opengl(self):
+        """Initialize OpenGL state once at startup"""
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+        
+        # Enable smooth shading
+        glShadeModel(GL_SMOOTH)
+        
+        glClearColor(0.5, 0.7, 1.0, 1.0)
+        
+        # Set up projection matrix once
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(70, self.width / self.height, 0.1, 100.0)
+        glMatrixMode(GL_MODELVIEW)
+        
+        # Better lighting setup for depth perception
+        glLightfv(GL_LIGHT0, GL_POSITION, [5.0, 10.0, 5.0, 1.0])  # Positional light
+        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.9, 0.9, 0.9, 1.0])
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
+        
+    def load_world_mesh(self, vertices: list, faces: list):
+        self.world_vertices = vertices
+        self.world_faces = faces
+        # Reset pre-calculated faces when new world is loaded
+        self._ground_faces = None
+        self._block_faces = None
+    
+    def load_hoops(self, hoops: list):
+        """Load hoop positions for the course"""
+        self.hoops = hoops
+    
+    def reset_drone(self):
+        self.physics.position = np.array([0.0, 0.2, 0.0], dtype=np.float32)
+        self.physics.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.physics.orientation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self.physics.angular_velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.physics.motor_speeds = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        print("Drone reset")
+    
+    def update_camera(self):
+        """Update FPV camera - 0 degree angle, follows drone orientation exactly"""
+        glLoadIdentity()
+        # Camera is at drone position with small offset forward
+        camera_offset_local = np.array([0.0, 0.0, 0.1])  # Small forward offset
+        camera_pos = self.physics.position + self.physics.quaternion_rotate_vector(
+            self.physics.orientation, camera_offset_local
+        )
+        # Forward direction in drone's local frame (0 degree camera angle = straight ahead)
+        forward_local = np.array([0.0, 0.0, -1.0])  # Forward in drone frame
+        forward_world = self.physics.quaternion_rotate_vector(
+            self.physics.orientation, forward_local
+        )
+        look_at = camera_pos + forward_world * 10.0
+        # Up direction in drone's local frame
+        up_local = np.array([0.0, 1.0, 0.0])  # Up in drone frame
+        up_world = self.physics.quaternion_rotate_vector(
+            self.physics.orientation, up_local
+        )
+        gluLookAt(
+            camera_pos[0], camera_pos[1], camera_pos[2],
+            look_at[0], look_at[1], look_at[2],
+            up_world[0], up_world[1], up_world[2]
+        )
+    
+    def draw_drone(self):
+        glPushMatrix()
+        glTranslatef(self.physics.position[0], self.physics.position[1], self.physics.position[2])
+        rot_matrix = self.physics.quaternion_to_rotation_matrix(self.physics.orientation)
+        glMultMatrixf(rot_matrix.T)
+        
+        size = 0.05
+        glColor3f(1.0, 0.0, 0.0)
+        glBegin(GL_QUADS)
+        # Front
+        glVertex3f(-size, -size, -size)
+        glVertex3f(size, -size, -size)
+        glVertex3f(size, size, -size)
+        glVertex3f(-size, size, -size)
+        # Back
+        glVertex3f(-size, -size, size)
+        glVertex3f(-size, size, size)
+        glVertex3f(size, size, size)
+        glVertex3f(size, -size, size)
+        # Top
+        glVertex3f(-size, size, -size)
+        glVertex3f(size, size, -size)
+        glVertex3f(size, size, size)
+        glVertex3f(-size, size, size)
+        # Bottom
+        glVertex3f(-size, -size, -size)
+        glVertex3f(-size, -size, size)
+        glVertex3f(size, -size, size)
+        glVertex3f(size, -size, -size)
+        # Right
+        glVertex3f(size, -size, -size)
+        glVertex3f(size, -size, size)
+        glVertex3f(size, size, size)
+        glVertex3f(size, size, -size)
+        # Left
+        glVertex3f(-size, -size, -size)
+        glVertex3f(-size, size, -size)
+        glVertex3f(-size, size, size)
+        glVertex3f(-size, -size, size)
+        glEnd()
+        
+        glColor3f(0.5, 0.5, 0.5)
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        arm_length = 0.13
+        glVertex3f(0, 0, 0)
+        glVertex3f(-arm_length, 0, -arm_length)
+        glVertex3f(0, 0, 0)
+        glVertex3f(arm_length, 0, -arm_length)
+        glVertex3f(0, 0, 0)
+        glVertex3f(-arm_length, 0, arm_length)
+        glVertex3f(0, 0, 0)
+        glVertex3f(arm_length, 0, arm_length)
+        glEnd()
+        
+        glPopMatrix()
+    
+    def draw_world(self):
+        if not self.world_vertices or not self.world_faces:
+            return
+        
+        # Pre-calculate which faces are ground vs blocks for performance
+        if not hasattr(self, '_ground_faces') or self._ground_faces is None:
+            self._ground_faces = []
+            self._block_faces = []
+            for i, face in enumerate(self.world_faces):
+                if len(face) >= 3:
+                    is_ground = True
+                    for idx in face[:3]:
+                        if 0 <= idx < len(self.world_vertices):
+                            if abs(self.world_vertices[idx][1]) > 0.01:
+                                is_ground = False
+                                break
+                    if is_ground:
+                        self._ground_faces.append(face)
+                    else:
+                        self._block_faces.append(face)
+        
+        # Draw ground with grid pattern for depth perception
+        glDisable(GL_LIGHTING)
+        glColor3f(0.4, 0.5, 0.4)  # Light green ground
+        glBegin(GL_TRIANGLES)
+        for face in self._ground_faces:
+            for idx in face:
+                if 0 <= idx < len(self.world_vertices):
+                    v = self.world_vertices[idx]
+                    glVertex3f(v[0], v[1], v[2])
+        glEnd()
+        
+        # Draw blocks with lighting and different colors (optimized)
+        glEnable(GL_LIGHTING)
+        glBegin(GL_TRIANGLES)
+        for face in self._block_faces:
+            if len(face) >= 3:
+                # Calculate normal for this face
+                v0 = np.array(self.world_vertices[face[0]])
+                v1 = np.array(self.world_vertices[face[1]])
+                v2 = np.array(self.world_vertices[face[2]])
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                normal = np.cross(edge1, edge2)
+                norm = np.linalg.norm(normal)
+                if norm > 0:
+                    normal = normal / norm
+                    glNormal3f(normal[0], normal[1], normal[2])
+                
+                # Color based on average height of face
+                avg_height = (v0[1] + v1[1] + v2[1]) / 3.0
+                height_factor = min(avg_height / 2.0, 1.0)
+                color_r = 0.5 + height_factor * 0.3
+                color_g = 0.3 + height_factor * 0.3
+                color_b = 0.2 + height_factor * 0.2
+                glColor3f(color_r, color_g, color_b)
+                
+                # Draw the triangle
+                for idx in face:
+                    if 0 <= idx < len(self.world_vertices):
+                        v = self.world_vertices[idx]
+                        glVertex3f(v[0], v[1], v[2])
+        glEnd()
+        
+        # Draw grid lines on ground for depth perception (reduced density)
+        glDisable(GL_LIGHTING)
+        glColor3f(0.2, 0.3, 0.2)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        grid_size = 100.0
+        grid_spacing = 10.0  # Increased from 5.0 to reduce lines
+        for i in range(int(-grid_size/grid_spacing), int(grid_size/grid_spacing) + 1):
+            x = i * grid_spacing
+            glVertex3f(x, 0.01, -grid_size)
+            glVertex3f(x, 0.01, grid_size)
+        for i in range(int(-grid_size/grid_spacing), int(grid_size/grid_spacing) + 1):
+            z = i * grid_spacing
+            glVertex3f(-grid_size, 0.01, z)
+            glVertex3f(grid_size, 0.01, z)
+        glEnd()
+        glEnable(GL_LIGHTING)
+    
+    def draw_hoops(self):
+        """Draw hoops as wireframe rings"""
+        if not self.hoops:
+            return
+        
+        glDisable(GL_LIGHTING)
+        glLineWidth(3.0)
+        
+        for hoop in self.hoops:
+            x, z, y_height, radius = hoop
+            
+            # Draw hoop as a circle in the XZ plane at height y_height
+            segments = 32
+            glColor3f(1.0, 0.5, 0.0)  # Orange color for visibility
+            
+            glBegin(GL_LINE_LOOP)
+            for i in range(segments):
+                angle = 2.0 * math.pi * i / segments
+                px = x + radius * math.cos(angle)
+                pz = z + radius * math.sin(angle)
+                glVertex3f(px, y_height, pz)
+            glEnd()
+            
+            # Draw a few vertical support lines for better visibility
+            glBegin(GL_LINES)
+            for i in range(4):
+                angle = 2.0 * math.pi * i / 4
+                px = x + radius * math.cos(angle)
+                pz = z + radius * math.sin(angle)
+                glVertex3f(px, y_height - 0.5, pz)
+                glVertex3f(px, y_height + 0.5, pz)
+            glEnd()
+        
+        glEnable(GL_LIGHTING)
+    
+    def render(self):
+        # Clear buffers first
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        
+        # Set modelview matrix
+        glMatrixMode(GL_MODELVIEW)
+        self.update_camera()
+        
+        # Draw scene (no drone - FPV view only shows what camera sees)
+        self.draw_world()
+        self.draw_hoops()  # Draw hoops for the course
+        # self.draw_drone()  # Removed - FPV view doesn't show the drone
+        
+        # Swap buffers
+        pygame.display.flip()
+    
+    def run(self):
+        running = True
+        print("=" * 60)
+        print("FPV Simulator - Full Control (Throttle + Pitch + Roll + Yaw)")
+        print("=" * 60)
+        print("Controls:")
+        print("  Axis 2 (Channel 2): Throttle (0% to 100%)")
+        print("  Axis 1 (Channel 1): Pitch (forward/back tilt)")
+        print("  Axis 0 (Channel 0): Roll (left/right tilt)")
+        print("  Axis 3 (Channel 3): Yaw (rotation)")
+        print("  R: Reset drone")
+        print("  ESC: Exit")
+        print("=" * 60)
+        
+        while running:
+            pygame.event.pump()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    elif event.key == pygame.K_r:
+                        self.reset_drone()
+            
+            # Get raw axis values directly
+            # Axis 0 = roll, Axis 1 = pitch, Axis 2 = throttle, Axis 3 = yaw
+            axis0_raw = self.controller.joystick.get_axis(0) if self.controller.connected and self.controller.joystick else 0.0
+            axis1_raw = self.controller.joystick.get_axis(1) if self.controller.connected and self.controller.joystick else 0.0
+            axis2_raw = self.controller.joystick.get_axis(2) if self.controller.connected and self.controller.joystick else 0.0
+            axis3_raw = self.controller.joystick.get_axis(3) if self.controller.connected and self.controller.joystick else 0.0
+            
+            # Throttle: Axis 2 from -1 (bottom) to +1 (top) -> map to 0.0 (bottom) to 1.0 (top)
+            throttle = (axis2_raw + 1.0) / 2.0
+            if throttle < 0.01:
+                throttle = 0.0
+            
+            # Pitch: Axis 1 (inverted because pygame inverts Y)
+            pitch_raw = -axis1_raw
+            
+            # Roll: Axis 0 (left/right stick movement)
+            roll_raw = axis0_raw
+            
+            # Apply exponential curves to pitch and roll for smoother center, more sensitive edges
+            expo_rate = 2.0  # 0.0 = linear, set to 2.0 for 3x sensitivity at max input
+            # Formula: output = input * (1 + expo_rate * input^2)
+            # At max input (1.0): output = 1.0 * (1 + 2.0) = 3.0 (3x more sensitive)
+            pitch = pitch_raw * (1.0 + expo_rate * pitch_raw * pitch_raw)
+            roll = roll_raw * (1.0 + expo_rate * roll_raw * roll_raw)
+            
+            # Yaw: Axis 3 (rotation)
+            yaw = axis3_raw
+            
+            # Set motor speeds (throttle, pitch, roll, and yaw)
+            self.physics.set_motor_speeds(throttle, pitch, roll, yaw)
+            
+            # Debug when pitch, roll, or yaw is applied
+            if abs(pitch) > 0.05:
+                print(f"Pitch: {pitch:.3f} (axis1_raw: {axis1_raw:.3f}), Motor speeds: {self.physics.motor_speeds}")
+                print(f"Angular velocity: {self.physics.angular_velocity}, Pitch component (X-axis): {self.physics.angular_velocity[0]:.3f}")
+            if abs(roll) > 0.05:
+                print(f"Roll: {roll:.3f} (axis0_raw: {axis0_raw:.3f}), Motor speeds: {self.physics.motor_speeds}")
+                print(f"Angular velocity: {self.physics.angular_velocity}, Roll component (Z-axis): {self.physics.angular_velocity[2]:.3f}")
+            if abs(yaw) > 0.05:
+                print(f"Yaw: {yaw:.3f} (axis3_raw: {axis3_raw:.3f}), Motor speeds: {self.physics.motor_speeds}")
+                print(f"Angular velocity: {self.physics.angular_velocity}, Yaw component (Y-axis): {self.physics.angular_velocity[1]:.3f}")
+            
+            # Update physics
+            self.physics.update(self.dt)
+            
+            # Render
+            self.render()
+            
+            self.dt = self.clock.tick(60) / 1000.0
+        
+        pygame.quit()
