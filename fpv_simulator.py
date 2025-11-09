@@ -220,6 +220,9 @@ class FPVSimulator:
         self.controller = DJIController()
         self.physics = QuadcopterPhysics()
         
+        # Second camera rotation (independent WASD-controlled camera for right viewport)
+        self.camera2_rotation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # Quaternion (w, x, y, z)
+        
         self.world_vertices = []
         self.world_faces = []
         self.hoops = []  # List of hoops: [(x, z, y_height, radius), ...]
@@ -269,6 +272,8 @@ class FPVSimulator:
         self.physics.orientation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self.physics.angular_velocity = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.physics.motor_speeds = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        # Reset camera2 rotation to match drone orientation
+        self.camera2_rotation = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         print("Drone reset")
     
     def update_camera(self):
@@ -295,6 +300,92 @@ class FPVSimulator:
             look_at[0], look_at[1], look_at[2],
             up_world[0], up_world[1], up_world[2]
         )
+    
+    def update_camera_secondary(self):
+        """Update second FPV camera - uses independent camera2_rotation (WASD-controlled)"""
+        glLoadIdentity()
+        # Camera is at drone position with small offset forward (same position as primary camera)
+        camera_offset_local = np.array([0.0, 0.0, 0.1])  # Small forward offset
+        camera_pos = self.physics.position + self.physics.quaternion_rotate_vector(
+            self.physics.orientation, camera_offset_local
+        )
+        
+        # Combine drone orientation with camera2 relative offset
+        # This makes camera2's "neutral" position always face forward relative to drone
+        # Like a pilot's body facing the nose, but head can rotate independently
+        combined_rotation = self.physics.quaternion_multiply(
+            self.physics.orientation, 
+            self.camera2_rotation
+        )
+        
+        # Forward direction based on combined rotation
+        forward_local = np.array([0.0, 0.0, -1.0])  # Forward in camera frame
+        forward_world = self.physics.quaternion_rotate_vector(
+            combined_rotation, forward_local
+        )
+        look_at = camera_pos + forward_world * 10.0
+        
+        # Up direction based on combined rotation
+        up_local = np.array([0.0, 1.0, 0.0])  # Up in camera frame
+        up_world = self.physics.quaternion_rotate_vector(
+            combined_rotation, up_local
+        )
+        gluLookAt(
+            camera_pos[0], camera_pos[1], camera_pos[2],
+            look_at[0], look_at[1], look_at[2],
+            up_world[0], up_world[1], up_world[2]
+        )
+    
+    def update_camera2_rotation(self, keys):
+        """Update camera2 rotation based on WASD keyboard input"""
+        rotation_speed = 2.0 * self.dt  # Rotation speed per frame
+        
+        # W/S: Pitch camera up/down (look up/down) - SWAPPED
+        if keys[pygame.K_w]:
+            # Pitch down: rotate around X-axis (positive for looking down)
+            pitch_rot = np.array([
+                math.cos(rotation_speed / 2),
+                math.sin(rotation_speed / 2),
+                0.0,
+                0.0
+            ], dtype=np.float32)
+            self.camera2_rotation = self.physics.quaternion_multiply(self.camera2_rotation, pitch_rot)
+        
+        if keys[pygame.K_s]:
+            # Pitch up: rotate around X-axis (negative for looking up)
+            pitch_rot = np.array([
+                math.cos(-rotation_speed / 2),
+                math.sin(-rotation_speed / 2),
+                0.0,
+                0.0
+            ], dtype=np.float32)
+            self.camera2_rotation = self.physics.quaternion_multiply(self.camera2_rotation, pitch_rot)
+        
+        # A/D: Yaw camera left/right (look left/right)
+        if keys[pygame.K_a]:
+            # Yaw left: rotate around Y-axis (positive for left)
+            yaw_rot = np.array([
+                math.cos(rotation_speed / 2),
+                0.0,
+                math.sin(rotation_speed / 2),
+                0.0
+            ], dtype=np.float32)
+            self.camera2_rotation = self.physics.quaternion_multiply(self.camera2_rotation, yaw_rot)
+        
+        if keys[pygame.K_d]:
+            # Yaw right: rotate around Y-axis (negative for right)
+            yaw_rot = np.array([
+                math.cos(-rotation_speed / 2),
+                0.0,
+                math.sin(-rotation_speed / 2),
+                0.0
+            ], dtype=np.float32)
+            self.camera2_rotation = self.physics.quaternion_multiply(self.camera2_rotation, yaw_rot)
+        
+        # Normalize quaternion to prevent drift
+        norm = np.linalg.norm(self.camera2_rotation)
+        if norm > 0:
+            self.camera2_rotation /= norm
     
     def draw_drone(self):
         glPushMatrix()
@@ -471,17 +562,35 @@ class FPVSimulator:
         glEnable(GL_LIGHTING)
     
     def render(self):
-        # Clear buffers first
+        # Clear buffers once
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         
-        # Set modelview matrix
+        # Calculate half width for split screen
+        half_width = self.width // 2
+        aspect_ratio = (half_width / self.height)
+        
+        # Left viewport: Original camera (follows drone orientation)
+        glViewport(0, 0, half_width, self.height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(70, aspect_ratio, 0.1, 100.0)
         glMatrixMode(GL_MODELVIEW)
         self.update_camera()
-        
-        # Draw scene (no drone - FPV view only shows what camera sees)
         self.draw_world()
-        self.draw_hoops()  # Draw hoops for the course
-        # self.draw_drone()  # Removed - FPV view doesn't show the drone
+        self.draw_hoops()
+        
+        # Right viewport: Second camera (WASD-controlled)
+        glViewport(half_width, 0, half_width, self.height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(70, aspect_ratio, 0.1, 100.0)
+        glMatrixMode(GL_MODELVIEW)
+        self.update_camera_secondary()
+        self.draw_world()
+        self.draw_hoops()
+        
+        # Reset viewport to full screen
+        glViewport(0, 0, self.width, self.height)
         
         # Swap buffers
         pygame.display.flip()
@@ -492,12 +601,16 @@ class FPVSimulator:
         print("FPV Simulator - Full Control (Throttle + Pitch + Roll + Yaw)")
         print("=" * 60)
         print("Controls:")
-        print("  Axis 2 (Channel 2): Throttle (0% to 100%)")
-        print("  Axis 1 (Channel 1): Pitch (forward/back tilt)")
-        print("  Axis 0 (Channel 0): Roll (left/right tilt)")
-        print("  Axis 3 (Channel 3): Yaw (rotation)")
-        print("  R: Reset drone")
-        print("  ESC: Exit")
+        print("  DJI Controller:")
+        print("    Axis 2 (Channel 2): Throttle (0% to 100%)")
+        print("    Axis 1 (Channel 1): Pitch (forward/back tilt)")
+        print("    Axis 0 (Channel 0): Roll (left/right tilt)")
+        print("    Axis 3 (Channel 3): Yaw (rotation)")
+        print("  Keyboard:")
+        print("    W/S: Look down/up (right camera pitch)")
+        print("    A/D: Look left/right (right camera yaw)")
+        print("    R: Reset drone and camera")
+        print("    ESC: Exit")
         print("=" * 60)
         
         while running:
@@ -510,6 +623,10 @@ class FPVSimulator:
                         running = False
                     elif event.key == pygame.K_r:
                         self.reset_drone()
+            
+            # Update camera2 rotation based on keyboard input (WASD)
+            keys = pygame.key.get_pressed()
+            self.update_camera2_rotation(keys)
             
             # Get raw axis values directly
             # Axis 0 = roll, Axis 1 = pitch, Axis 2 = throttle, Axis 3 = yaw
